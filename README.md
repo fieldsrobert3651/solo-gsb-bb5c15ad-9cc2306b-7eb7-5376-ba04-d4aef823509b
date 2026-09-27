@@ -40,6 +40,14 @@
 可行时返回按稿件、角色分组且顺序确定的完整名单；不可行时按角色返回缺口，
 不输出任何部分分配。
 
+`POST /assign-coverage` 提供**带评审人下标的覆盖度分配**：沿用 `/assign` 的全部字段
+（稿件、评审人、主题回避、`track` / `track_capacities` 赛道限额与 `capacity` 总容量），
+评审人额外声明 `min_assignments`（缺省 `0`）表示本轮**至少**分到的稿件数。每稿所需人数
+与全部评审人的下限、上限在同一个**全局带下界可行流**网络中一次联立求解；下限大于容量、
+合格稿件不足、赛道限额结构性冲突或下限之和超过总需求时返回 `infeasible` 与结构化原因，
+共享容量争用导致联立下无解时同样整体不可行——任何不可行情形都**不输出部分名单**。
+相同输入（甚至不同的列表顺序）必然产生完全相同的输出。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -55,6 +63,7 @@ docker compose up --build
 | http://localhost:8000/health | 健康检查 |
 | http://localhost:8000/assign | 分配接口（POST） |
 | http://localhost:8000/assign-roles | 分角色分配接口（POST） |
+| http://localhost:8000/assign-coverage | 覆盖度分配接口（POST，评审人可声明 `min_assignments` 下限） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/redoc | ReDoc 文档 |
 
@@ -576,6 +585,106 @@ docker run -p 8000:8000 review-assign
 - `eligible_remaining_capacity`：最大流结束后这些候选对该稿赛道的剩余可接量之和
   （候选受赛道限额约束时，取总剩余容量与赛道剩余限额的较小者）。
 
+### `POST /assign-coverage`（评审人下标的覆盖度分配）
+
+请求字段与 `POST /assign` 完全相同（稿件、评审人、请求级 `required_reviewers`、
+主题匹配、`authors` / `conflicted_authors` / `conflicted_manuscripts` 回避、
+`track` / `track_capacities` 分赛道限额、评审人 `capacity` 总容量），区别仅在于：
+
+- 评审人可声明 `min_assignments`（非负整数，缺省 `0`）：本轮**至少**分到的稿件数；
+  上限仍为其 `capacity`（与分赛道限额）。
+- 不支持 `previous_assignments` / `locked_assignments` / `balance_workload`
+  （携带这些字段返回 `422`）。
+- `min_assignments` 字段也可出现在 `POST /assign` 的请求中，但该接口忽略它。
+
+全部稿件需求与全部评审人上/下限在同一个**全局带下界可行流**网络中联立求解
+（标准下界变换 + Edmonds-Karp，非逐稿贪心），一次得到完整可行解；不存在时整体
+判定不可行，绝不输出部分名单。
+
+请求体示例：
+
+```json
+{
+  "required_reviewers": 1,
+  "manuscripts": [
+    {"id": "m1", "authors": ["alice"], "topics": ["ml"]},
+    {"id": "m2", "authors": ["bob"], "topics": ["ml"]},
+    {"id": "m3", "authors": ["carol"], "topics": ["nlp"], "track": "poster"}
+  ],
+  "reviewers": [
+    {"id": "r1", "topics": ["ml", "nlp"], "capacity": 3, "min_assignments": 1},
+    {"id": "r2", "topics": ["ml"], "capacity": 2},
+    {"id": "r3", "topics": ["nlp"], "capacity": 2, "min_assignments": 1,
+     "track_capacities": {"poster": 1}}
+  ]
+}
+```
+
+可行时响应（`200`）：名单格式与 `/assign` 相同（稿件按 ID 排序、名单按 ID 排序），
+其中每位评审人的实际分配数都落在 `[min_assignments, capacity]` 内且满足赛道限额：
+
+```json
+{
+  "status": "feasible",
+  "total_required": 3,
+  "total_assigned": 3,
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r1"]},
+    {"manuscript_id": "m3", "reviewer_ids": ["r3"]}
+  ],
+  "conflicts": null,
+  "unsatisfied": null,
+  "shared_pool": null,
+  "bottleneck_cut": null
+}
+```
+
+不可行时响应（`200`，`assignments` 为 `null`，**不输出任何部分分配**），
+`conflicts` 给出一条或多条结构化原因（一次返回全部、按类型与 ID 确定排序）：
+
+| `conflicts[].type` | 含义 | 携带字段 |
+| --- | --- | --- |
+| `min_exceeds_capacity` | 评审人 `min_assignments` 大于其 `capacity` | `reviewer_id`, `minimum`, `capacity` |
+| `min_exceeds_eligible_manuscripts` | 评审人评全部合格稿件（经主题/回避过滤）也达不到下限 | `reviewer_id`, `minimum`, `eligible` |
+| `min_exceeds_track_capacity` | 分赛道限额结构性地压低了可分上限，达不到下限 | `reviewer_id`, `minimum`, `track`, `limit` |
+| `min_exceeds_total_demand` | 全部评审人下限之和超过稿件总需求 | `minimum_sum`, `total_required` |
+| `coverage_infeasible` | 需求侧本身可满足，但下限在共享总容量/赛道限额下联立无解；`reviewer_ids` 列出下限未能补满的评审人（按 ID 排序，仅为定位用） | `reviewer_ids` |
+
+例如评审人下限大于容量时：
+
+```json
+{
+  "status": "infeasible",
+  "total_required": 1,
+  "total_assigned": 0,
+  "assignments": null,
+  "conflicts": [
+    {
+      "type": "min_exceeds_capacity",
+      "detail": "评审人 r1 声明 min_assignments=2，大于其容量 1",
+      "reviewer_id": "r1",
+      "minimum": 2,
+      "capacity": 1,
+      "eligible": null,
+      "track": null,
+      "limit": null,
+      "minimum_sum": null,
+      "total_required": null,
+      "reviewer_ids": []
+    }
+  ],
+  "unsatisfied": null,
+  "shared_pool": null,
+  "bottleneck_cut": null
+}
+```
+
+当忽略全部下限后稿件需求本身仍不可行时（资格/赛道/总容量不足），除
+`coverage_infeasible` 外还会复用 `/assign` 的缺口诊断：`unsatisfied`、
+`shared_pool` 与 `bottleneck_cut`（字段含义见上文「`bottleneck_cut`：不可行的
+全局最小割证明」），同样不输出部分名单。
+
 ### 示例调用
 
 ```bash
@@ -675,6 +784,27 @@ curl -s -X POST http://localhost:8000/assign-roles \
       }'
 # -> assignments 按稿件、角色分组：m1 的 chair->r1、reviewer->r2（r1 不能身兼两角），
 #    m2 的 reviewer->r2、r3（r3 的 poster 赛道限额 1 与总容量同时生效）
+
+# 覆盖度分配：r1 至少 1 篇、r3 至少 1 篇（且 r3 的 poster 赛道限额 1），
+# 稿件需求与全部评审人上/下限由全局带下界流一次联立求解
+curl -s -X POST http://localhost:8000/assign-coverage \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "required_reviewers": 1,
+        "manuscripts": [
+          {"id": "m1", "authors": ["alice"], "topics": ["ml"]},
+          {"id": "m2", "authors": ["bob"], "topics": ["ml"]},
+          {"id": "m3", "authors": ["carol"], "topics": ["nlp"], "track": "poster"}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["ml", "nlp"], "capacity": 3, "min_assignments": 1},
+          {"id": "r2", "topics": ["ml"], "capacity": 2},
+          {"id": "r3", "topics": ["nlp"], "capacity": 2, "min_assignments": 1,
+           "track_capacities": {"poster": 1}}
+        ]
+      }'
+# -> 完整名单中 r1、r3 各至少 1 篇且均不超过容量/赛道限额；不可行时返回 conflicts，
+#    assignments 为 null，不输出任何部分名单
 ```
 
 ## 算法与确定性
@@ -711,6 +841,16 @@ curl -s -X POST http://localhost:8000/assign-roles \
   容量为 1，保证同一评审人对同一稿件最多承担一个角色；全部角色共享评审人总容量
   与赛道限额，在同一流网络中一次求解（Dinic 最大流），避免按角色分别分配时争用
   共享容量；不可行时按 (稿件, 角色) 输出缺口，不输出部分分配。
+- 覆盖度分配（`/assign-coverage`）：在普通网络两端把 `源 -> 稿件` 改为
+  `lower=upper=所需人数` 的双边量、`评审人 -> 汇` 改为
+  `lower=min_assignments, upper=capacity`，并加 `汇 -> 源` 的无穷大闭环边，构成
+  **带下界环流**；标准变换后（每条边先强制流过下界，残量容量为上界减下界，按节点
+  不平衡量加超级源/汇边）做 Edmonds-Karp 最大流，灌满全部超级源出边当且仅当存在
+  同时满足稿件需求与评审人上/下限的完整可行解，资格边上的流量即名单。赛道限额
+  节点原样保留，与下限、总容量在同一网络联立；结构性预检（下限大于容量、合格稿件
+  不足、赛道限额结构性冲突、下限之和超过总需求）与需求侧预检先行给出严格归因，
+  通过预检仍无解即共享容量争用（`coverage_infeasible`）；任何不可行情形都不输出
+  部分名单。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
@@ -728,12 +868,13 @@ uvicorn app.main:app --reload --port 8000   # 本地起服务
 
 ```
 app/
-  main.py      # FastAPI 入口：/health、/assign、/assign-roles
+  main.py      # FastAPI 入口：/health、/assign、/assign-roles、/assign-coverage
   models.py    # 请求/响应模型与校验
-  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 分角色全局分配
+  solver.py    # 分配求解器：普通模式全局最大流 + 增量模式最小费用最大流 + 负载均衡字典序优化 + 分角色全局分配 + 覆盖度全局带下界流
 tests/
-  test_assign.py        # /assign 端到端测试
-  test_assign_roles.py  # /assign-roles 端到端测试
+  test_assign.py           # /assign 端到端测试
+  test_assign_roles.py     # /assign-roles 端到端测试
+  test_assign_coverage.py  # /assign-coverage 端到端测试（含暴力枚举一致性）
 Dockerfile
 docker-compose.yml
 requirements.txt

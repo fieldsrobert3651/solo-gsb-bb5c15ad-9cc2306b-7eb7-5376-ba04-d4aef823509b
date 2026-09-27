@@ -46,6 +46,13 @@ class ReviewerIn(BaseModel):
             "未列出的赛道仅受总容量约束"
         ),
     )
+    min_assignments: int = Field(
+        default=0, ge=0, le=1000,
+        description=(
+            "本轮至少分到的稿件数（缺省 0）；仅 POST /assign-coverage 使用，"
+            "POST /assign 忽略该字段"
+        ),
+    )
 
 
 class AssignmentIn(BaseModel):
@@ -328,3 +335,73 @@ class RoleAssignResponse(BaseModel):
     assignments: list[ManuscriptRolesOut] | None
     # 不可行时给出各角色缺口诊断；可行时为 null
     unsatisfied: list[RoleUnsatisfiedOut] | None
+
+
+# ---------- POST /assign-coverage：评审人下标的覆盖度分配 ----------
+
+
+class CoverageAssignRequest(BaseModel):
+    """覆盖度分配请求：字段与 /assign 相同（不含增量/负载均衡选项）。
+
+    评审人可声明 min_assignments（缺省 0）：本轮至少分到的稿件数。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    manuscripts: list[ManuscriptIn] = Field(max_length=10000)
+    reviewers: list[ReviewerIn] = Field(max_length=10000)
+    required_reviewers: int = Field(
+        default=1, ge=0, le=100,
+        description="每稿默认所需评审数（稿件级 required_reviewers 可覆盖）",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "CoverageAssignRequest":
+        m_ids = [m.id for m in self.manuscripts]
+        if len(m_ids) != len(set(m_ids)):
+            raise ValueError("manuscripts 中存在重复的 id")
+        r_ids = [r.id for r in self.reviewers]
+        if len(r_ids) != len(set(r_ids)):
+            raise ValueError("reviewers 中存在重复的 id")
+        return self
+
+
+class CoverageConflictOut(BaseModel):
+    """覆盖度分配不可行的一条结构化原因。"""
+
+    type: Literal[
+        "min_exceeds_capacity",
+        "min_exceeds_eligible_manuscripts",
+        "min_exceeds_track_capacity",
+        "min_exceeds_total_demand",
+        "coverage_infeasible",
+    ]
+    detail: str
+    # 评审人级原因携带
+    reviewer_id: str | None = None
+    minimum: int | None = None
+    capacity: int | None = None
+    eligible: int | None = None
+    # 赛道限额原因携带
+    track: str | None = None
+    limit: int | None = None
+    # 全局下限之和原因携带
+    minimum_sum: int | None = None
+    total_required: int | None = None
+    # coverage_infeasible 时下限未能补满的评审人 ID（按 ID 排序）
+    reviewer_ids: list[str] | None = None
+
+
+class CoverageAssignResponse(BaseModel):
+    status: Literal["feasible", "infeasible"]
+    total_required: int
+    total_assigned: int
+    # 可行时给出完整分配（每位评审人分配数 >= min_assignments 且 <= capacity）；
+    # 不可行时为 null（不输出部分结果）
+    assignments: list[AssignmentOut] | None
+    # 不可行时给出结构化原因；可行时为 null
+    conflicts: list[CoverageConflictOut] | None
+    # 需求侧本身不可行（忽略全部下限仍不可行）时复用 /assign 的缺口诊断
+    unsatisfied: list[UnsatisfiedOut] | None = None
+    shared_pool: SharedPoolOut | None = None
+    bottleneck_cut: BottleneckCutOut | None = None

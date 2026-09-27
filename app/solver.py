@@ -64,13 +64,28 @@ max_cap）：先在 1/max_cap 整数网格上二分，把最优值定位到宽�
 - 主题、利益冲突、自稿回避与分赛道限额规则与 /assign 完全一致（复用同一套
   资格过滤）；可行时返回按稿件、角色分组且顺序确定的完整名单，不可行时按
   (稿件, 角色) 返回缺口诊断，不输出任何部分分配。
+
+覆盖度分配（solve_coverage，对应 POST /assign-coverage）：稿件/评审人字段
+与 /assign 完全相同（含主题回避、赛道限额与总容量），评审人额外声明
+min_assignments（缺省 0）表示本轮至少分到的稿件数。全部稿件需求与全部评审人
+上/下限在同一个**全局带下界可行流**网络中联立求解：
+
+    OS ==(lower=upper=所需人数)==> 稿件 --(0,1, 合格)--> (评审人,赛道)/评审人
+        --(赛道限额)--> 评审人 ==(lower=min, upper=capacity)==> OT --(inf)--> OS
+
+标准下界变换（先强制流过各边下界、按不平衡量加超级源/汇、OT->OS 闭环）后做
+Edmonds-Karp 最大流：灌满全部超级源出边当且仅当存在完整可行解，资格边上的
+流量即确定名单。下限大于容量、合格稿件不足或赛道限额结构性冲突、下限之和超过
+总需求时直接返回结构化原因；需求侧本身不可行时复用 /assign 的缺口诊断与
+bottleneck_cut；共享容量争用导致下界联立不可行时返回 coverage_infeasible
+并列出未补满的下限评审人——任何不可行情形都不输出部分名单。
 """
 
 from __future__ import annotations
 
 import heapq
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 
 
@@ -96,6 +111,8 @@ class ReviewerSpec:
     track_capacities: tuple[tuple[str, int], ...] = ()
     # 可担任的评审角色（去重排序）；仅分角色分配（/assign-roles）使用
     roles: tuple[str, ...] = ()
+    # 本轮至少要分到的稿件数；仅覆盖度分配（/assign-coverage）使用
+    min_assignments: int = 0
 
 
 @dataclass(frozen=True)
@@ -205,6 +222,50 @@ class RoleSolveResult:
     total_required: int
     total_assigned: int
     unsatisfied: tuple[RoleUnsatisfied, ...]
+
+
+@dataclass(frozen=True)
+class CoverageConflict:
+    """覆盖度分配（/assign-coverage）不可行的结构化原因。
+
+    - min_exceeds_capacity：评审人 min_assignments 大于其总容量
+      （reviewer_id / minimum / capacity 给出数值）；
+    - min_exceeds_eligible_manuscripts：评审人即使评全部合格稿件也达不到下限
+      （eligible 给出合格稿件数）；
+    - min_exceeds_track_capacity：受分赛道限额限制，评审人可分得的上限低于下限
+      （track / limit 给出具体受限赛道）；
+    - min_exceeds_total_demand：全部评审人下限之和超过总稿件需求
+      （minimum_sum / total_required 给出数值）；
+    - coverage_infeasible：稿件需求可满足（去掉全部下限后可行）但与各下限联立
+      不可行（共享容量争用 / Hall 型争用），reviewer_ids 给出带下界流求解时
+      未能灌满的下限边对应评审人（确定排序，仅为定位用，可能不止一种归因）。
+    """
+
+    type: str
+    detail: str
+    reviewer_id: str | None = None
+    minimum: int | None = None
+    capacity: int | None = None
+    eligible: int | None = None
+    track: str | None = None
+    limit: int | None = None
+    minimum_sum: int | None = None
+    total_required: int | None = None
+    reviewer_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CoverageSolveResult:
+    feasible: bool
+    # manuscript_id -> 已排序的 reviewer id 元组；不可行时为空（不输出部分结果）
+    assignments: dict[str, tuple[str, ...]]
+    total_required: int
+    total_assigned: int
+    conflicts: tuple[CoverageConflict, ...] = ()
+    # 仅稿件需求侧（忽略全部下限）不可行时携带：复用 /assign 的缺口诊断
+    unsatisfied: tuple[UnsatisfiedManuscript, ...] = ()
+    shared_pool: dict | None = None
+    bottleneck_cut: BottleneckCut | None = None
 
 
 @dataclass(frozen=True)
@@ -1442,4 +1503,318 @@ def solve_role_assignment(
         total_required=total_required,
         total_assigned=total_assigned,
         unsatisfied=tuple(unsatisfied),
+    )
+
+
+# ---------- POST /assign-coverage：带评审人下标的覆盖度分配 ----------
+
+
+def solve_coverage(
+    manuscripts: list[ManuscriptSpec],
+    reviewers: list[ReviewerSpec],
+) -> CoverageSolveResult:
+    """覆盖度分配：在满足每稿所需人数的同时满足每位评审人的下限与上限。
+
+    评审人可声明 min_assignments（缺省 0）：本轮至少分到的稿件数；上限仍为其
+    capacity（与分赛道限额）。问题整体规约为**全局带下界可行流**（circulation
+    with lower bounds）一次求解，而非逐稿贪心：
+
+        OS --(lower=upper=所需人数)--> 稿件 m
+        稿件 m --(0,1, 仅当合格)--> (评审人 r,赛道) -> 评审人 r
+        评审人 r --(lower=min_assignments, upper=capacity)--> OT
+        OT --(无穷大)--> OS （闭环回流）
+
+    标准变换：每条边先强制流过下界（lower），残量网络容量为 upper - lower，
+    按强制流的不平衡量加 SS/TT 节点与 SS->v（亏空）/ v->TT（盈余）边，再补
+    OT->OS 的无穷大闭环边；SS 到 TT 的最大流灌满全部 SS 出边当且仅当存在
+    同时满足稿件需求与评审人上/下限的完整可行解，此时 m->r 资格边上的流量
+    （= 下界强制份额 + 残量增广份额）即分配名单。不可行时不输出任何部分结果。
+
+    所有节点按业务 ID 排序后建图、邻接顺序固定，Edmonds-Karp 结果完全确定：
+    相同输入（甚至不同的列表顺序）必然产生完全相同的分配结果。
+    """
+    # 按 ID 排序，保证建图顺序与输入列表顺序无关 -> 输出稳定
+    ms = sorted(manuscripts, key=lambda m: m.id)
+    rs = sorted(reviewers, key=lambda r: r.id)
+    m_count, r_count = len(ms), len(rs)
+    total_required = sum(m.required_reviewers for m in ms)
+    total_min = sum(r.min_assignments for r in rs)
+
+    def fail(
+        conflicts: list[CoverageConflict],
+        *,
+        total_assigned: int = 0,
+        unsatisfied: tuple[UnsatisfiedManuscript, ...] = (),
+        shared_pool: dict | None = None,
+        bottleneck_cut: BottleneckCut | None = None,
+    ) -> CoverageSolveResult:
+        conflicts.sort(key=lambda c: (
+            c.type,
+            c.reviewer_id or "",
+            c.track or "",
+        ))
+        return CoverageSolveResult(
+            feasible=False,
+            assignments={},
+            total_required=total_required,
+            total_assigned=total_assigned,
+            conflicts=tuple(conflicts),
+            unsatisfied=unsatisfied,
+            shared_pool=shared_pool,
+            bottleneck_cut=bottleneck_cut,
+        )
+
+    # ---- 1. 逐评审人结构性预检：不依赖全局即可严格判定的下限冲突 ----
+    pre_conflicts: list[CoverageConflict] = []
+    eligible = [_eligible_reviewers(m, rs) for m in ms]
+    eligible_ms_for_r: list[set[int]] = [set() for _ in rs]
+    for i in range(m_count):
+        for j in eligible[i]:
+            eligible_ms_for_r[j].add(i)
+
+    for j, r in enumerate(rs):
+        lo = r.min_assignments
+        if lo <= 0:
+            continue
+        if lo > r.capacity:
+            pre_conflicts.append(CoverageConflict(
+                type="min_exceeds_capacity",
+                reviewer_id=r.id, minimum=lo, capacity=r.capacity,
+                detail=(
+                    f"评审人 {r.id} 声明 min_assignments={lo}，大于其容量 {r.capacity}"
+                ),
+            ))
+            continue
+        n_elig = len(eligible_ms_for_r[j])
+        if lo > n_elig:
+            pre_conflicts.append(CoverageConflict(
+                type="min_exceeds_eligible_manuscripts",
+                reviewer_id=r.id, minimum=lo, eligible=n_elig,
+                detail=(
+                    f"评审人 {r.id} 至少需评审 {lo} 篇，但其合格稿件仅 {n_elig} 篇"
+                    "（主题能力或回避限制）"
+                ),
+            ))
+            continue
+        # 分赛道限额下该评审人可分得的理论上限（放宽总容量，仅看赛道结构）：
+        # 不携带赛道、或赛道未列入映射的合格稿件各计 1；受限赛道至多取
+        # min(赛道限额, 该赛道合格稿件数)。此上限仍低于下限即结构性不可行。
+        caps = dict(r.track_capacities)
+        free_eligible = 0
+        per_track_count: dict[str, int] = {}
+        for i in eligible_ms_for_r[j]:
+            track = ms[i].track
+            if track is not None and track in caps:
+                per_track_count[track] = per_track_count.get(track, 0) + 1
+            else:
+                free_eligible += 1
+        cap_upper = free_eligible + sum(
+            min(caps[t], per_track_count.get(t, 0)) for t in sorted(caps)
+        )
+        if lo > cap_upper:
+            # 归因到 ID 最小、限额本身低于下限且该评审人确有合格稿件的受限赛道
+            breach = next(
+                ((t, caps[t]) for t in sorted(caps)
+                 if caps[t] < lo and per_track_count.get(t, 0) > 0),
+                None,
+            )
+            if breach is not None:
+                track, limit = breach
+                pre_conflicts.append(CoverageConflict(
+                    type="min_exceeds_track_capacity",
+                    reviewer_id=r.id, minimum=lo, track=track, limit=limit,
+                    detail=(
+                        f"评审人 {r.id} 至少需评审 {lo} 篇，但其在赛道 {track} 的"
+                        f"限额仅 {limit}，分赛道容量联立后无法达到下限"
+                    ),
+                ))
+            else:  # 理论上不可达：仅当总容量更紧，已在前面报出，此处兜底
+                pre_conflicts.append(CoverageConflict(
+                    type="min_exceeds_track_capacity",
+                    reviewer_id=r.id, minimum=lo,
+                    detail=(
+                        f"评审人 {r.id} 至少需评审 {lo} 篇，分赛道容量联立后"
+                        "可分得的上限低于该下限"
+                    ),
+                ))
+    # 全局预检：下限之和超过总需求（每稿至多接受需求数个名额，全局名额不足）
+    if total_min > total_required:
+        pre_conflicts.append(CoverageConflict(
+            type="min_exceeds_total_demand",
+            minimum_sum=total_min, total_required=total_required,
+            detail=(
+                f"全部评审人 min_assignments 之和为 {total_min}，超过稿件总需求 "
+                f"{total_required}，无法同时满足所有下限"
+            ),
+        ))
+    if pre_conflicts:
+        return fail(pre_conflicts)
+
+    # ---- 2. 需求侧可行性：忽略全部下限（min_assignments 置 0）后先求一次最大流。
+    # 不可行则与普通 /assign 同因（稿件需求在资格/赛道/总容量下无法满足），
+    # 复用其缺口诊断与全局最小割证明，不输出部分结果。
+    rs_zeroed = [replace(r, min_assignments=0) for r in rs]
+    base = _solve_normal(ms, rs_zeroed)
+    if not base.feasible:
+        return fail(
+            [CoverageConflict(
+                type="coverage_infeasible",
+                detail=(
+                    "即使不要求任何评审人下限，稿件需求也无法满足；"
+                    "见 unsatisfied / shared_pool / bottleneck_cut 诊断"
+                ),
+            )],
+            total_assigned=base.total_assigned,
+            unsatisfied=base.unsatisfied,
+            shared_pool=base.shared_pool,
+            bottleneck_cut=base.bottleneck_cut,
+        )
+
+    # ---- 3. 构建全局带下界流网络 ----
+    # 业务节点布局与普通模式一致：OS | 稿件 | 评审人 | (评审人,赛道) 限额节点，
+    # 其后追加 OT（闭环回流目标）、SS / TT（下界变换的超级源/汇）。
+    OS = 0
+    track_nodes, nxt = _track_node_layout(m_count, rs)
+
+    def m_node(i: int) -> int:
+        return 1 + i
+
+    def r_node(j: int) -> int:
+        return 1 + m_count + j
+
+    def mr_target(i: int, j: int) -> int:
+        track = ms[i].track
+        if track is not None:
+            node = track_nodes[j].get(track)
+            if node is not None:
+                return node
+        return r_node(j)
+
+    OT = nxt
+    SS = nxt + 1
+    TT = nxt + 2
+    track_caps = [dict(r.track_capacities) for r in rs]
+
+    # 残量网络容量（upper - lower）与节点强制流不平衡量 balance[v]
+    # （= 进入 v 的下界之和 - 离开 v 的下界之和；balance>0 需 SS 补入，
+    #   balance<0 需排向 TT）。
+    cap = [[0] * (TT + 1) for _ in range(TT + 1)]
+    adj: list[list[int]] = [[] for _ in range(TT + 1)]
+
+    def add_residual(u: int, v: int, c: int) -> None:
+        if c <= 0:
+            return
+        if v not in adj[u]:
+            adj[u].append(v)
+        if u not in adj[v]:
+            adj[v].append(u)
+        cap[u][v] += c
+
+    balance = [0] * (TT + 1)
+
+    def force_lower(u: int, v: int, lower: int) -> None:
+        """边 u->v 强制流过 lower：记不平衡量，不进入残量网络。"""
+        balance[v] += lower
+        balance[u] -= lower
+
+    # OS -> 稿件：lower = upper = 所需人数（需求必须满足）
+    for i, m in enumerate(ms):
+        force_lower(OS, m_node(i), m.required_reviewers)
+    # 稿件 -> (评审人,赛道) / 评审人：资格边，(0, 1)
+    for i in range(m_count):
+        for j in eligible[i]:
+            add_residual(m_node(i), mr_target(i, j), 1)
+    # (评审人,赛道) -> 评审人：赛道限额 (0, limit)
+    for j in range(r_count):
+        for track, node in track_nodes[j].items():
+            add_residual(node, r_node(j), track_caps[j][track])
+    # 评审人 -> OT：(lower = min_assignments, upper = capacity)
+    r_lower: list[int] = []
+    for j, r in enumerate(rs):
+        r_lower.append(r.min_assignments)
+        force_lower(r_node(j), OT, r.min_assignments)
+        add_residual(r_node(j), OT, r.capacity - r.min_assignments)
+    # OT -> OS：闭环回流，容量取全部边流量之和的上界即可（无穷大容量）
+    add_residual(OT, OS, total_required + total_min + 1)
+
+    # 超级源/汇边：balance>0 -> SS->v；balance<0 -> v->TT
+    need = 0
+    for v in range(OT + 1):
+        if balance[v] > 0:
+            add_residual(SS, v, balance[v])
+            need += balance[v]
+        elif balance[v] < 0:
+            add_residual(v, TT, -balance[v])
+
+    # Edmonds-Karp：邻接顺序由按 ID 排序的建图顺序确定，结果完全确定
+    pushed = 0
+    while True:
+        parent = [-1] * (TT + 1)
+        parent[SS] = SS
+        q = deque([SS])
+        while q and parent[TT] == -1:
+            u = q.popleft()
+            for v in adj[u]:
+                if parent[v] == -1 and cap[u][v] > 0:
+                    parent[v] = u
+                    q.append(v)
+        if parent[TT] == -1:
+            break
+        bottleneck = None
+        v = TT
+        while v != SS:
+            u = parent[v]
+            bottleneck = cap[u][v] if bottleneck is None else min(bottleneck, cap[u][v])
+            v = u
+        v = TT
+        while v != SS:
+            u = parent[v]
+            cap[u][v] -= bottleneck
+            cap[v][u] += bottleneck
+            v = u
+        pushed += bottleneck
+
+    if pushed != need:
+        # 带下界完整可行解不存在。评审人 r 的亏空只能经 r -> TT 排向超级汇：
+        # 该边仍有残量即其 min_assignments 未能补满，作为共享容量争用的定位信息。
+        shortfall_r = [
+            rs[j].id
+            for j, r in enumerate(rs)
+            if r.min_assignments > 0 and cap[r_node(j)][TT] > 0
+        ]
+        conflicts = [CoverageConflict(
+            type="coverage_infeasible",
+            reviewer_ids=tuple(shortfall_r),
+            detail=(
+                "稿件需求与评审人 min_assignments 下限在共享总容量/赛道限额下"
+                "不存在完整可行解（全局带下界流不可行）"
+                + (
+                    "；下限未能满足的评审人: " + ", ".join(shortfall_r)
+                    if shortfall_r else ""
+                )
+            ),
+        )]
+        return fail(conflicts)
+
+    # ---- 4. 提取完整可行解：m->r 资格边（容量上界 1）上的流量。
+    # 下界强制份额已在 r->OT 侧记账，资格边本身 lower=0，边上流量即
+    # 残量网络中反向边的残量（cap[target][m]）。
+    assignments: dict[str, tuple[str, ...]] = {}
+    for i, m in enumerate(ms):
+        picked = tuple(
+            sorted(
+                rs[j].id
+                for j in eligible[i]
+                if cap[mr_target(i, j)][m_node(i)] > 0
+            )
+        )
+        assignments[m.id] = picked
+
+    total_assigned = sum(len(v) for v in assignments.values())
+    assert total_assigned == total_required
+    return CoverageSolveResult(
+        feasible=True,
+        assignments=assignments,
+        total_required=total_required,
+        total_assigned=total_assigned,
     )

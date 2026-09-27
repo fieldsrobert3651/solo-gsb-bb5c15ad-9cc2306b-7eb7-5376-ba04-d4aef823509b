@@ -11,6 +11,9 @@ from .models import (
     AssignResponse,
     BottleneckCutEdgeOut,
     BottleneckCutOut,
+    CoverageAssignRequest,
+    CoverageAssignResponse,
+    CoverageConflictOut,
     LoadRatioOut,
     LockedConflictOut,
     ManuscriptRolesOut,
@@ -27,12 +30,13 @@ from .solver import (
     ManuscriptSpec,
     ReviewerSpec,
     solve_assignment,
+    solve_coverage,
     solve_role_assignment,
 )
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -49,6 +53,10 @@ app = FastAPI(
         "评审人声明可担任角色，全部稿件的全部角色在同一流网络中一次全局求解，"
         "同一评审人对同一稿件最多承担一个角色，所有角色共享总容量与赛道限额；"
         "可行时返回按稿件、角色分组的完整名单，不可行时返回各角色缺口。"
+        "支持覆盖度分配（POST /assign-coverage）：评审人声明 min_assignments "
+        "本轮至少分到的稿件数，稿件需求与全部评审人上/下限用全局带下界流一次"
+        "联立求完整可行解；下限大于容量、资格不足或共享容量冲突时整体不可行，"
+        "返回结构化原因且不输出部分名单。"
         "服务无状态，不持久化任何稿件/评审信息。"
     ),
 )
@@ -249,4 +257,70 @@ def assign_roles(req: RoleAssignRequest) -> RoleAssignResponse:
         total_assigned=result.total_assigned,
         assignments=None,
         unsatisfied=[RoleUnsatisfiedOut(**vars(u)) for u in result.unsatisfied],
+    )
+
+
+@app.post("/assign-coverage", response_model=CoverageAssignResponse, tags=["assign"])
+def assign_coverage(req: CoverageAssignRequest) -> CoverageAssignResponse:
+    default_required = req.required_reviewers
+    manuscripts = [
+        ManuscriptSpec(
+            id=m.id,
+            authors=tuple(m.authors),
+            topics=tuple(m.topics),
+            required_reviewers=(
+                m.required_reviewers
+                if m.required_reviewers is not None
+                else default_required
+            ),
+            track=m.track,
+        )
+        for m in req.manuscripts
+    ]
+    reviewers = [
+        ReviewerSpec(
+            id=r.id,
+            topics=tuple(r.topics),
+            capacity=r.capacity,
+            conflicted_authors=tuple(r.conflicted_authors),
+            conflicted_manuscripts=tuple(r.conflicted_manuscripts),
+            track_capacities=(
+                tuple(sorted(r.track_capacities.items()))
+                if r.track_capacities
+                else ()
+            ),
+            min_assignments=r.min_assignments,
+        )
+        for r in req.reviewers
+    ]
+
+    result = solve_coverage(manuscripts, reviewers)
+
+    if result.feasible:
+        return CoverageAssignResponse(
+            status="feasible",
+            total_required=result.total_required,
+            total_assigned=result.total_assigned,
+            assignments=[
+                AssignmentOut(manuscript_id=mid, reviewer_ids=list(rids))
+                for mid, rids in sorted(result.assignments.items())
+            ],
+            conflicts=None,
+        )
+
+    return CoverageAssignResponse(
+        status="infeasible",
+        total_required=result.total_required,
+        total_assigned=result.total_assigned,
+        assignments=None,
+        conflicts=[CoverageConflictOut(**vars(c)) for c in result.conflicts],
+        unsatisfied=[UnsatisfiedOut(**vars(u)) for u in result.unsatisfied]
+        if result.unsatisfied
+        else None,
+        shared_pool=SharedPoolOut(**result.shared_pool) if result.shared_pool else None,
+        bottleneck_cut=(
+            _to_bottleneck_cut_out(result.bottleneck_cut)
+            if result.bottleneck_cut
+            else None
+        ),
     )

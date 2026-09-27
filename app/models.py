@@ -226,6 +226,78 @@ class AssignResponse(BaseModel):
     balance: WorkloadBalanceOut | None = None
 
 
+# ---------- POST /assign-coverage：评审人下限覆盖 ----------
+
+
+class CoverageReviewerIn(ReviewerIn):
+    """评审人字段与 /assign 相同，另可声明本轮至少分到的稿件数。"""
+
+    min_assignments: int = Field(
+        default=0, ge=0, le=1000,
+        description="本轮至少分到的稿件数（下界）；缺省为 0",
+    )
+
+
+class CoverageAssignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    manuscripts: list[ManuscriptIn] = Field(max_length=10000)
+    reviewers: list[CoverageReviewerIn] = Field(max_length=10000)
+    required_reviewers: int = Field(
+        default=1, ge=0, le=100,
+        description="每稿默认所需评审数（稿件级 required_reviewers 可覆盖）",
+    )
+
+    @model_validator(mode="after")
+    def _check_unique_ids(self) -> "CoverageAssignRequest":
+        m_ids = [m.id for m in self.manuscripts]
+        if len(m_ids) != len(set(m_ids)):
+            raise ValueError("manuscripts 中存在重复的 id")
+        r_ids = [r.id for r in self.reviewers]
+        if len(r_ids) != len(set(r_ids)):
+            raise ValueError("reviewers 中存在重复的 id")
+        return self
+
+
+class CoverageConflictOut(BaseModel):
+    """评审人下限的结构性冲突（不需求解即可判定整体不可行）。"""
+
+    type: Literal["min_exceeds_capacity", "min_exceeds_eligible"]
+    reviewer_id: str
+    min_assignments: int
+    # 冲突上限：容量（min_exceeds_capacity）或个人可接上限（min_exceeds_eligible）
+    limit: int
+    detail: str
+
+
+class ReviewerShortfallOut(BaseModel):
+    """评审人侧诊断：全局最优努力下仍达不到下限的评审人。"""
+
+    reviewer_id: str
+    min_assignments: int
+    # 最优努力下实际能分到的稿件数
+    attained: int
+    missing: int
+
+
+class CoverageAssignResponse(BaseModel):
+    status: Literal["feasible", "infeasible"]
+    total_required: int
+    # 全部评审人声明的下限之和
+    total_min_required: int
+    # 可行时等于 total_required；不可行时恒为 0（不输出任何部分名单）
+    total_assigned: int
+    # 可行时给出完整分配；不可行时为 null（不输出部分名单）
+    assignments: list[AssignmentOut] | None
+    # 结构性冲突（下限>容量 / 下限>个人可接上限）时非空；否则为 null
+    reviewer_conflicts: list[CoverageConflictOut] | None
+    # 稿件侧缺口诊断（忽略下限仍无法完整覆盖时非空）；否则为 null
+    unsatisfied: list[UnsatisfiedOut] | None
+    shared_pool: SharedPoolOut | None
+    # 评审人侧下限缺口诊断（凑不够下限时非空）；否则为 null
+    reviewer_shortfalls: list[ReviewerShortfallOut] | None
+
+
 # ---------- POST /assign-roles：分角色分配 ----------
 
 _RoleName = Annotated[str, Field(min_length=1, max_length=128)]

@@ -11,9 +11,13 @@ from .models import (
     AssignResponse,
     BottleneckCutEdgeOut,
     BottleneckCutOut,
+    CoverageAssignRequest,
+    CoverageAssignResponse,
+    CoverageConflictOut,
     LoadRatioOut,
     LockedConflictOut,
     ManuscriptRolesOut,
+    ReviewerShortfallOut,
     RoleAssignRequest,
     RoleAssignResponse,
     RoleAssignmentOut,
@@ -27,12 +31,13 @@ from .solver import (
     ManuscriptSpec,
     ReviewerSpec,
     solve_assignment,
+    solve_coverage_assignment,
     solve_role_assignment,
 )
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
         "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
@@ -45,6 +50,11 @@ app = FastAPI(
         "支持负载均衡：balance_workload=true 时完整可行解按字典序优化——"
         "先最小化最大负载率（分配数/capacity，约分分数比较，不依赖浮点），"
         "再最小化相对上一轮的改动数，最后按 ID 破同。"
+        "支持评审人下限覆盖（POST /assign-coverage）：评审人可声明 "
+        "min_assignments（本轮至少分到的稿件数，缺省 0），接口在满足每稿所需"
+        "人数的同时满足所有评审人的下限与上限，使用全局带下界流求完整可行解；"
+        "下限大于容量、资格不足或共享容量冲突时返回 infeasible 并给出稿件侧 / "
+        "评审人侧结构化诊断，不输出部分名单。"
         "支持分角色分配（POST /assign-roles）：稿件按角色声明所需人数、"
         "评审人声明可担任角色，全部稿件的全部角色在同一流网络中一次全局求解，"
         "同一评审人对同一稿件最多承担一个角色，所有角色共享总容量与赛道限额；"
@@ -188,6 +198,95 @@ def assign(req: AssignRequest) -> AssignResponse:
         bottleneck_cut=(
             _to_bottleneck_cut_out(result.bottleneck_cut)
             if result.bottleneck_cut
+            else None
+        ),
+    )
+
+
+@app.post("/assign-coverage", response_model=CoverageAssignResponse, tags=["assign"])
+def assign_coverage(req: CoverageAssignRequest) -> CoverageAssignResponse:
+    default_required = req.required_reviewers
+    manuscripts = [
+        ManuscriptSpec(
+            id=m.id,
+            authors=tuple(m.authors),
+            topics=tuple(m.topics),
+            required_reviewers=(
+                m.required_reviewers
+                if m.required_reviewers is not None
+                else default_required
+            ),
+            track=m.track,
+        )
+        for m in req.manuscripts
+    ]
+    reviewers = [
+        ReviewerSpec(
+            id=r.id,
+            topics=tuple(r.topics),
+            capacity=r.capacity,
+            conflicted_authors=tuple(r.conflicted_authors),
+            conflicted_manuscripts=tuple(r.conflicted_manuscripts),
+            track_capacities=(
+                tuple(sorted(r.track_capacities.items()))
+                if r.track_capacities
+                else ()
+            ),
+            min_assignments=r.min_assignments,
+        )
+        for r in req.reviewers
+    ]
+
+    result = solve_coverage_assignment(manuscripts, reviewers)
+
+    # 结构性冲突：下限>容量 / 下限>个人可接上限，不输出任何部分名单
+    if result.reviewer_conflicts:
+        return CoverageAssignResponse(
+            status="infeasible",
+            total_required=result.total_required,
+            total_min_required=result.total_min_required,
+            total_assigned=result.total_assigned,
+            assignments=None,
+            reviewer_conflicts=[
+                CoverageConflictOut(**vars(c)) for c in result.reviewer_conflicts
+            ],
+            unsatisfied=None,
+            shared_pool=None,
+            reviewer_shortfalls=None,
+        )
+
+    if result.feasible:
+        return CoverageAssignResponse(
+            status="feasible",
+            total_required=result.total_required,
+            total_min_required=result.total_min_required,
+            total_assigned=result.total_assigned,
+            assignments=[
+                AssignmentOut(manuscript_id=mid, reviewer_ids=list(rids))
+                for mid, rids in sorted(result.assignments.items())
+            ],
+            reviewer_conflicts=None,
+            unsatisfied=None,
+            shared_pool=None,
+            reviewer_shortfalls=None,
+        )
+
+    return CoverageAssignResponse(
+        status="infeasible",
+        total_required=result.total_required,
+        total_min_required=result.total_min_required,
+        total_assigned=result.total_assigned,
+        assignments=None,
+        reviewer_conflicts=None,
+        unsatisfied=(
+            [UnsatisfiedOut(**vars(u)) for u in result.unsatisfied]
+            if result.unsatisfied
+            else None
+        ),
+        shared_pool=SharedPoolOut(**result.shared_pool) if result.shared_pool else None,
+        reviewer_shortfalls=(
+            [ReviewerShortfallOut(**vars(s)) for s in result.reviewer_shortfalls]
+            if result.reviewer_shortfalls
             else None
         ),
     )
